@@ -21,6 +21,7 @@ typedef uint8_t gfx_error;
 #define TILESET_COMP_4BIT   2
 #define TILESET_COMP_2BIT   3
 #define TILESET_COMP_RLE    16
+#define TILESET_COMP_LZ     17
 
 
 /**

@@ -66,11 +66,23 @@ __asm
 _memset_vram_loop:
     ld a, b
     or c
-    ret z
+    ret z ; degenerate case of size 0 or loop done
     ld (hl), e
+#if 0
     inc hl
     dec bc
     jp _memset_vram_loop
+#else
+    dec bc
+    ld a,b
+    or c
+    ret z ; degenerate case of size 1
+    ld d,h
+    ld e,l
+    inc de
+    ldir  ; copy the first byte to the rest of the bytes
+    ret
+#endif
 __endasm;
 }
 
@@ -276,7 +288,7 @@ static gfx_error gfx_tileset_load_rle(gfx_context* ctx, uint8_t* data, uint16_t 
         if(j >= TILE_SIZE_8BIT) {
             gfx_tileset_options options = {
                 .compression = TILESET_COMP_NONE, // load uncompressed data
-                .from_byte = from + (tile_count * TILE_SIZE_8BIT), // offset by the current tile index?
+                .from_byte = from + (tile_count << 8), // offset by the current tile index?
                 .pal_offset = pal_offset, // copy over
                 .opacity = opacity, // copy over
             };
@@ -289,9 +301,154 @@ static gfx_error gfx_tileset_load_rle(gfx_context* ctx, uint8_t* data, uint16_t 
     return GFX_SUCCESS;
 }
 
+static gfx_error gfx_tileset_load_lz(gfx_context* ctx, uint8_t* data, uint16_t size, uint16_t from, uint8_t pal_offset, uint8_t opacity) {
+    // Encoded so that:
+    // - if the highest 2-bits are 00, it is a literal byte, to be copied as is (after adding pal_offset and applying opacity if needed)
+    // - if the highest 2-bits are 01, it is a run of literal bytes, where the count is in the lower 6-bits, and the literal bytes follow.
+    //   The count is to be increased by 1.
+    // - if the highest 2-bits are 10, it is a reference to previous bytes, where the length is in 2-bits (shifted 4) and the offset is in the lower 4 bits. 
+    //   The length is to be increased by 3, and the offset is to be increased by 1 (to allow references of 1 to 4 bytes). The reference is to 
+    //   the already decoded data in the current tile, so it can only reference old data from the 256 byte circular buffer.
+    // - if the highest 2-bits are 11, it is a reference to previous bytes, where the length is in 6-bits and the offset is in the next byte
+    //   The length is to be increased by 4, and the offset is to be increased by 1 (to allow references of 1 to 256 bytes). The reference can be to
+    //   already decoded data in the 256 byte circular buffer
+    uint8_t buffer[TILE_SIZE_8BIT];
+
+    uint16_t i = 0; // data index
+    uint16_t j = 0; // buffer index
+    uint16_t tile_count = 0;
+
+    while (i < size) {
+        uint8_t byte = data[i]; // RLE byte
+        i++; // every other byte
+        uint8_t type = byte & 0xc0;
+        if(type == 0x00) {
+            // Literal byte
+            uint8_t value = byte & 0x3f;
+            buffer[j++] = value;
+        } else if (type == 0x40) {
+            // Run of literal bytes
+            uint8_t count = (byte & 0x3f) + 1;
+            for (uint8_t k = 0; k < count; k++) {
+                uint8_t value = data[i];
+                buffer[j++] = value;
+                i++;
+            }
+        } else if (type == 0x80) {
+            // Reference with 2-bit length and 4-bit offset (circular buffer)
+            uint8_t length = ((byte & 0x30) >> 4) + 3;
+            uint8_t offset = (byte & 0x0F) + 1;
+            for (uint8_t k = 0; k < length; k++) {
+                buffer[j] = buffer[(uint8_t)(j - offset)];
+                j++;
+            }
+        } else if (type == 0xc0) {
+            // Reference with 6-bit length and 8-bit offset (circular buffer)
+            uint8_t length = (byte & 0x3f) + 4;
+            uint8_t offset = data[i] + 1;
+            i++;
+            for (uint8_t k = 0; k < length; k++) {
+                buffer[j] = buffer[(uint8_t)(j - offset)];
+                j++;
+            }
+        }
+
+        if(j >= TILE_SIZE_8BIT) {
+            gfx_tileset_options options = {
+                .compression = TILESET_COMP_NONE, // load uncompressed data
+                .from_byte = from + (tile_count << 8), // offset by the current tile index?
+                .pal_offset = pal_offset, // copy over
+                .opacity = opacity, // copy over
+            };
+            gfx_tileset_load(ctx, &buffer, TILE_SIZE_8BIT,  &options);
+            tile_count++;
+            j = 0;
+        }
+    }
+
+    return GFX_SUCCESS;
+}
+
+void memaddcpyopacity(uint8_t* dst, uint8_t* src, size_t size, uint8_t offset)
+{
+    (void) dst;
+    (void) src;
+    (void) size;
+    (void) offset;
+    __asm
+    push    ix
+    ld      ix,#0
+    add     ix,sp
+    ;while (size) {
+    LD C, 4(IX)
+    LD B, 5(IX)
+memaddcpyopacity_loop:
+    LD A,B
+    OR C
+    JR Z, memaddcpyopacity_done
+    ;    uint8_t byte = *src + offset;
+    LD A,(DE)
+    ;    if (byte == offset) {
+    OR A
+    JR Z, memaddcpyopacity_skip
+    ;        byte = 0;
+    ADD A, 6(IX)
+    ;    }
+memaddcpyopacity_skip:
+    ;    *dst = byte;
+    LD (HL), A
+    ;    src++;
+    INC DE
+    ;    dst++;
+    INC HL  
+    ;    size--;
+    DEC BC
+    JR memaddcpyopacity_loop
+    ;}
+memaddcpyopacity_done:
+    pop ix
+    __endasm;
+}
+
+void memaddcpynoopacity(uint8_t* dst, uint8_t* src, size_t size, uint8_t offset)
+{
+    (void) dst;
+    (void) src;
+    (void) size;
+    (void) offset;
+    __asm
+    push    ix
+    ld      ix,#0
+    add     ix,sp
+    ;while (size) {
+    LD C, 4(IX)
+    LD B, 5(IX)
+memaddcpynoopacity_loop:
+    LD A,B
+    OR C
+    JR Z, memaddcpynoopacity_done
+    ;    uint8_t byte = *src + offset;
+    LD A,(DE)
+    ADD A, 6(IX)
+    ;    *dst = byte;
+    LD (HL), A
+    ;    src++;
+    INC DE
+    ;    dst++;
+    INC HL  
+    ;    size--;
+    DEC BC
+    JR memaddcpynoopacity_loop
+    ;}
+memaddcpynoopacity_done:
+    pop ix
+    __endasm;
+}
+
 void memaddcpy(uint8_t* dst, uint8_t* src, size_t size, uint8_t opacity, uint8_t offset)
 {
     if (offset) {
+#if 0
         while (size) {
             uint8_t byte = *src + offset;
             if (opacity && byte == offset) {
@@ -302,6 +459,13 @@ void memaddcpy(uint8_t* dst, uint8_t* src, size_t size, uint8_t opacity, uint8_t
             dst++;
             size--;
         }
+#else
+        if (opacity) {
+            memaddcpyopacity(dst, src, size, offset);
+        } else {
+            memaddcpynoopacity(dst, src, size, offset);
+        }
+#endif
     } else {
         memcpy(dst, src, size);
     }
@@ -334,6 +498,12 @@ gfx_error gfx_tileset_load(gfx_context* ctx, void* tileset, uint16_t size, const
         case TILESET_COMP_RLE:
             if (ctx->bpp == 8)
                 return gfx_tileset_load_rle(ctx, user_tileset, size, from, pal_offset, opacity);
+            return GFX_INVALID_ARG;
+        case TILESET_COMP_LZ:
+            if (ctx->bpp == 8)
+                return gfx_tileset_load_lz(ctx, user_tileset, size, from, pal_offset, opacity);
+            return GFX_INVALID_ARG;
+        default:
             return GFX_INVALID_ARG;
         }
     } else {

@@ -1,3 +1,4 @@
+parser.add_argument("-z","--compressed", help="Decompress tile data; defaults to rle when no mode is provided", nargs="?", choices=["rle", "lz"], const="rle", default=None)
 #!/usr/bin/env python3
 
 import math
@@ -13,7 +14,7 @@ parser.add_argument("-t","--tileset", help="Zeal Tileset (ZTS)", required=True)
 parser.add_argument("-p", "--palette", help="Zeal Palette (ZTP)", required=True)
 parser.add_argument("-o", "--output", help="Output GIF Filename")
 parser.add_argument("-b", "--bpp", help="Bits Per Pixel", type=int, default=8, choices=[1,2,4,8])
-parser.add_argument("-z", "--compressed", help="Decompress RLE", action="store_true")
+parser.add_argument("-z", "--compressed", help="Decompress tile data; defaults to rle when no mode is provided", nargs="?", choices=["rle", "lz"], const="rle", default=None)
 parser.add_argument("-s", "--show", help="Open in Viewer", action="store_true")
 parser.add_argument("-v", "--verbose", help="Verbose output", action='store_true')
 parser.add_argument("-d", "--debug", help="Debug output", action='store_true')
@@ -139,14 +140,84 @@ def decompress(data):
 
   return bytes(ret)
 
+def decompress_lz(data):
+  """Decompress a stream encoded with the Zeal LZ format, one 256-byte tile at a time.
+
+  Token types (top 2 bits of header byte):
+    00xxxxxx  - literal byte, value = lower 6 bits
+    01cccccc  - literal run: (cc+1) raw bytes follow
+    10llOOOO  - back-ref: length = ll+3 (3-6), offset = OOOO+1 (1-16), circular
+    11llllll  - back-ref: length = ll+4 (4-67), offset = next_byte+1 (1-256), circular
+  Back-references use a 256-byte circular buffer preserved across tile boundaries.
+  """
+  TILE_SIZE = 256
+  result = []
+  i = 0
+  n = len(data)
+  buf = [0] * TILE_SIZE  # circular decode buffer, NOT cleared between tiles
+  j = 0                  # write position mod 256
+
+  while i < n:
+    tile_out = 0
+    while tile_out < TILE_SIZE and i < n:
+      byte = data[i]
+      i += 1
+      token_type = byte & 0xc0
+
+      if token_type == 0x00:
+        # Literal byte (value 0x00-0x3F)
+        buf[j] = byte & 0x3f
+        j = (j + 1) & 0xFF
+        tile_out += 1
+
+      elif token_type == 0x40:
+        # Literal run
+        count = (byte & 0x3f) + 1
+        for _ in range(count):
+          if i < n:
+            buf[j] = data[i]
+            i += 1
+            j = (j + 1) & 0xFF
+            tile_out += 1
+
+      elif token_type == 0x80:
+        # Short back-reference: 2-bit length (3-6), 4-bit offset (1-16), circular
+        length = ((byte & 0x30) >> 4) + 3
+        offset = (byte & 0x0f) + 1
+        for _ in range(length):
+          buf[j] = buf[(j - offset) & 0xFF]
+          j = (j + 1) & 0xFF
+          tile_out += 1
+
+      else:  # 0xc0
+        # Long back-reference: 6-bit length (4-67), 8-bit offset (1-256), circular
+        length = (byte & 0x3f) + 4
+        if i < n:
+          offset = data[i] + 1
+          i += 1
+        else:
+          offset = 1
+        for _ in range(length):
+          buf[j] = buf[(j - offset) & 0xFF]
+          j = (j + 1) & 0xFF
+          tile_out += 1
+
+    # j has wrapped back to 0 after exactly 256 bytes; buf holds the complete tile in order
+    result.extend(buf[:tile_out] if tile_out < TILE_SIZE else buf)
+
+  return bytes(result)
+
+
 def convert(args):
   palette = getPalette(args.palette)
 
   data = None
   with open(args.tileset, mode="rb") as f:
     data = f.read()
-    if(args.compressed):
+    if args.compressed == "rle":
       data = decompress(data)
+    elif args.compressed == "lz":
+      data = decompress_lz(data)
     data = io.BytesIO(data)
 
   tiles = []
